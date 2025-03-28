@@ -2,6 +2,7 @@
 pssh
 * file propagation/mirroring over openssh
 
+STATE: currently this is just the solution the question at the bottom of the README, rest of description is what it will be (eventually)
 
 Target can be specified in whatever the rust equivalent of make's configure is,
 so that it doesn't have to be specified more than once, maybe multiple hosts
