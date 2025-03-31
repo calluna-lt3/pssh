@@ -1,15 +1,20 @@
+use core::panic;
 use std::collections::{HashMap, VecDeque};
 use std::env;
-use std::fs::{self, read_dir, DirEntry};
+use std::fmt::Result;
+use std::fs::{read_dir, DirEntry};
 use std::path::{Path, PathBuf};
 use std::process::exit;
 use std::time::SystemTime;
 
 use chrono::{DateTime, Local};
+use futures::stream::{StreamExt, FuturesUnordered};
 use notify::{Event, EventKind, RecursiveMode, Watcher};
-use tokio::{select, signal};
+use notify::event::{RemoveKind, CreateKind};
+use tokio::{fs, select, signal};
 
-const DEFAULT_INBOX: &'static str = "./INBOX/";
+const DEFAULT_INBOX: &'static str = "INBOX/";
+const DEFAULT_TARGET: &'static str = "CLONE/";
 
 struct Args {
     contents: Vec<String>,
@@ -64,8 +69,8 @@ fn init_inbox() -> String {
         None => String::from(DEFAULT_INBOX),
     };
 
-    if let Ok(false) = fs::exists(&directory) {
-        fs::create_dir(&directory).unwrap();
+    if let Ok(false) = std::fs::exists(&directory) {
+        std::fs::create_dir(&directory).unwrap();
     }
 
     return directory;
@@ -101,40 +106,6 @@ fn find_files_in(path: &Path) -> Option<Vec<String>> {
     }
 }
 
-fn _print_index(index: &HashMap<String, SystemTime>) {
-    index.into_iter().for_each(|(path, st)| {
-        let dt = || -> String {
-            let time: DateTime<Local> = DateTime::from(*st);
-            time.format("%Y-%m-%d %H:%M").to_string()
-        }();
-        println!("[{dt}] {path}");
-    });
-}
-
-fn _print_event(event: &Event) {
-    match event.kind {
-        EventKind::Create(_) => {
-            event.paths.iter().for_each(|path| {
-                print!("[NEW] ");
-                println!("{file}", file = path.display());
-            });
-        }
-        EventKind::Modify(_) => {
-            event.paths.iter().for_each(|path| {
-                print!("[MOD] ");
-                println!("{file}", file = path.display());
-            });
-        }
-        EventKind::Remove(_) => {
-            event.paths.iter().for_each(|path| {
-                print!("[DEL] ");
-                println!("{file}", file = path.display());
-            });
-        }
-        _ => return,
-    };
-}
-
 struct FileIndex {
     index: HashMap<PathBuf, SystemTime>,
     location: PathBuf,
@@ -150,7 +121,7 @@ impl FileIndex {
         let mut index: HashMap<PathBuf, SystemTime> = HashMap::new();
 
         for file in files {
-            let md = fs::metadata(&file).unwrap();
+            let md = std::fs::metadata(&file).unwrap();
             let time = md.modified().unwrap();
             index.insert(PathBuf::from(&file), time);
         }
@@ -164,7 +135,10 @@ impl FileIndex {
     // Notify docs specify that there can be more than one file per event, however I haven't
     // observed this. This currently only handles the first file per event, and will display number
     // of events if > 1 event.
-    fn handle_event(&mut self, event: &Event) {
+    //
+    // i think making this async causes a race condition where order of event processing might get
+    // fucked up ? but idk lmao
+    async fn handle_event(&mut self, event: &Event) -> Option<PathBuf> {
         let k = event.paths[0].to_str().expect("path is not valid unicode");
         let i = k
             .find(self.location.to_str().expect("path is not valid unicode"))
@@ -172,35 +146,37 @@ impl FileIndex {
         let k = PathBuf::from(&k[i..]);
 
 
-        // was getting events for files that didn't exist, so exists() checks manage those
-        //  e.g. ./INBOX/4913
+        // was getting random events for files that dont exist here e.g. ./INBOX/4913
         match event.kind {
-            EventKind::Create(_) => {
-                if !k.exists() { return }
+            EventKind::Create(kind) => {
+                if !k.exists() { return None }
+                if kind == CreateKind::Folder { return None }
 
-                let md = fs::metadata(&k).unwrap();
+                let md = fs::metadata(&k).await.unwrap();
                 let v = md.modified().unwrap();
                 self.index.insert(k.clone(), v);
                 print!("[NEW] ");
             }
             EventKind::Modify(_) => {
-                if !k.exists() { return }
+                if !k.exists() || k.is_dir() { return None }
 
-                let md = fs::metadata(&k).unwrap();
+                let md = fs::metadata(&k).await.unwrap();
                 let v = md.modified().unwrap();
                 self.index.insert(k.clone(), v);
                 print!("[MOD] ");
             }
-            EventKind::Remove(_) => {
+            EventKind::Remove(kind) => {
+                if kind == RemoveKind::Folder { return None }
                 self.index.remove(&k);
                 print!("[DEL] ");
             }
-            _ => return,
+            _ => return None,
         };
 
         let num_events = event.paths.len();
         if num_events > 1 { print!("({num_events}) "); }
         println!("{file}", file = k.display());
+        Some(k)
     }
 
     fn print(&self) {
@@ -214,16 +190,85 @@ impl FileIndex {
     }
 }
 
+fn host_path_to_target(host: &PathBuf) -> PathBuf {
+    let host = host.to_string_lossy();
+    let target = host.replace(DEFAULT_INBOX, DEFAULT_TARGET);
+
+    PathBuf::from(target)
+}
+
+// Tries to copy from -> to, path isn't found creates the path
+async fn copy_with_dir(from: &PathBuf, to: &PathBuf) {
+    let mut target_path = to.clone();
+    match fs::copy(&from, &to).await {
+        Ok(_) => {},
+        Err(err) if err.kind() == tokio::io::ErrorKind::NotFound => {
+            target_path.pop();
+            if let Err(err) = fs::create_dir_all(&target_path).await {
+                panic!("ERROR: couldn't crate path to {path}: {err}", path = target_path.display());
+            } else {
+                fs::copy(&from, &to).await.expect(format!("path to '{}' was constructed but isn't valid", to.display()).as_str());
+            }
+        },
+        Err(err) => panic!("ERROR: idk: {err}"),
+    };
+}
+
+// for now, just do async file i/o into clone dir, convert to doing it over ssh later
+// precondition: event is one of: new, remove, modify, event is on a file
+// initial files are already mirrored
+//
+// host_file has to be moved into mirror() due to some issue awaiting multiple futures
+// i dont like this however im never reusing the value so its kinda fine
+async fn mirror(host_file: &String, event: Option<&Event>) -> tokio::io::Result<()> {
+    let host_file = PathBuf::from(&host_file);
+    let target_path = host_path_to_target(&host_file);
+    let target_file = target_path.clone();
+
+
+    match event {
+        None => copy_with_dir(&host_file, &target_file).await,
+        Some(event) => {
+            match event.kind {
+                EventKind::Create(_) => {
+                    copy_with_dir(&host_file, &target_file).await;
+                },
+                EventKind::Modify(_) => {
+                    if host_file.is_file() {
+                        fs::copy(host_file, target_file).await?;
+                    }
+                },
+                EventKind::Remove(_) => {
+                    fs::remove_file(target_file).await?;
+                },
+                _ => panic!("Passed invalid event to mirror"),
+            }
+        },
+    };
+
+
+    Ok(())
+}
+
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<> {
     let directory = init_inbox();
     let directory = PathBuf::from(directory);
     let mut index = FileIndex::new(directory.clone());
     index.print();
 
-    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    // TODO: one find_files_in() call (one is in FileIndex::new())
 
-    let task = tokio::task::spawn_blocking(async move || {
+    // Clone initial files
+    // TODO: proper error handling, log mirror failures
+    if let Some(files) = find_files_in(&directory) {
+        let futures: FuturesUnordered<_> = (&files).into_iter().map(|f| mirror(&f, None)).collect();
+        futures.collect::<Vec<_>>().await;
+    }
+
+    // Start task to monitor files
+    let (tx, mut rx) = tokio::sync::mpsc::channel(10);
+    let task = tokio::task::spawn(async move {
         let mut watcher = notify::recommended_watcher(move |event| {
             tx.blocking_send(event)
                 .expect("couldn't send event over channel");
@@ -239,12 +284,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     break;
                 }
                 event = rx.recv() => {
-                    match event {
-                        Some(x) => {
-                            index.handle_event(&x.unwrap());
-                        },
-                        None => {},
-                    };
+                    if let Some(x) = event {
+                        let x = x.unwrap();
+                        let path = index.handle_event(&x).await;
+                        if let Some(p) = path {
+                            // TODO: error handling here (dont panic)
+                            // just log error and continue
+                            match mirror(&p.to_string_lossy().to_string(), Some(&x)).await {
+                                Err(err) => { eprintln!("Failed to mirror {path}: {err}", path = p.display()) },
+                                Ok(_) => {},
+                            };
+                        }
+                    }
                 }
             };
         }
@@ -253,7 +304,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         index.print();
     });
 
-    task.await.unwrap().await;
+    task.await.unwrap();
 
     Ok(())
 }

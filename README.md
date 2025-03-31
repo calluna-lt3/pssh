@@ -2,7 +2,14 @@
 pssh
 * file propagation/mirroring over openssh
 
-STATE: currently this is just the solution the question at the bottom of the README, rest of description is what it will be (eventually)
+STATE: mirrors all files in HOST dir to TARGET dir, monitors and copies those changes:w
+       does all of this locally
+
+TODO:
+    * do above over ssh
+    * non-fatal error handling (log and continue)
+    * add option to clone initial directory (currently does it by default)
+    * log changes
 
 Target can be specified in whatever the rust equivalent of make's configure is,
 so that it doesn't have to be specified more than once, maybe multiple hosts
@@ -19,24 +26,24 @@ Initial propagation (sync):
     1. read config file
         * has ssh connection information
     2. open ssh connections
-    3. copy directory contents from HOST to TARGET
+    3. (OPTIONAL) copy directory contents from HOST to TARGET
         * consider when directory on TARGET isn't empty
 
 Monitoring (async):
     1. monitor changes in HOST dir
-    2. log changes to stdout + log file
+    2. log changes
     3. propagate any changes detected on HOST to all TARGETS
 
 Cleanup (sync):
     1. close connections
     2. give a summary of changes made
-        * maybe just dump file index
+        * might just be available in log file
 
-Notes
-- if file exists on target, ask for confirmation
-    * (option to disable this and just propagate everything)
-- HOST does not track changes to TARGETS files, it's only responsible for
-  reflecting the changes done on HOST to all TARGETS
+Notes:
+    * HOST does not track changes to TARGETS files, it's only responsible for
+      reflecting the changes done on HOST to all TARGETS
+    * would be interesting to invert this, monitor files changes on target's
+      machine and mirror them to host's (seems actually useful)
 
 
 idea originated from here:
