@@ -2,7 +2,7 @@
 pssh
 * file propagation/mirroring over openssh
 
-STATE: mirrors all files in HOST dir to TARGET dir, monitors and copies those changes:w
+STATE: mirrors all files in HOST dir to TARGET dir, monitors and copies those changes
        does all of this locally
 
 TODO:
@@ -76,6 +76,4 @@ https://codereview.stackexchange.com/questions/294623/file-list-and-monitor
         3. Not using mutexes
         4. Having separation of concerns
 << =======
-
-
 ```
