@@ -3,11 +3,13 @@ use std::collections::{HashMap, VecDeque};
 use std::env;
 use std::fmt::Result;
 use std::fs::{read_dir, DirEntry};
+use std::panic::Location;
 use std::path::{Path, PathBuf};
 use std::process::exit;
 use std::time::SystemTime;
 
 use chrono::{DateTime, Local};
+use futures::future::OptionFuture;
 use futures::stream::{StreamExt, FuturesUnordered};
 use notify::{Event, EventKind, RecursiveMode, Watcher};
 use notify::event::{RemoveKind, CreateKind};
@@ -15,6 +17,7 @@ use tokio::{fs, select, signal};
 
 const DEFAULT_INBOX: &'static str = "INBOX/";
 const DEFAULT_TARGET: &'static str = "CLONE/";
+const DEFAULT_LOG: &'static str = "fm.log";
 
 struct Args {
     contents: Vec<String>,
@@ -44,6 +47,32 @@ impl Iterator for Args {
         }
     }
 }
+
+struct Logs {
+    log_path: PathBuf,
+    file: Option<fs::File>,
+}
+
+impl Logs {
+    fn new(log_path: Option<&PathBuf>) -> Self {
+        let log_path = match log_path {
+            Some(path) => path.clone(),
+            None => PathBuf::from(DEFAULT_LOG),
+        };
+
+        Self {
+            log_path,
+            file: None
+        }
+    }
+
+    async fn write(&mut self) {
+        if let None = self.file {
+            self.file = Some(fs::File::options().append(true).open(&self.log_path).await.unwrap());
+        }
+    }
+}
+
 
 fn usage() {
     println!("Usage: fm [OPTION] [ARGUMENT]");
@@ -92,8 +121,13 @@ fn find_files_in(path: &Path) -> Option<Vec<String>> {
 
         let file_md = file.metadata().unwrap();
         if file_md.is_dir() {
-            let dir = read_dir(file.path()).unwrap();
-            dir.for_each(|sub_file| cur_files.push_back(sub_file.unwrap()));
+            let dir = read_dir(file.path());
+            match dir {
+                Err(e) => {
+                    eprintln!("WARN: Failed to read dir '{path}': {e}", path = file.path().display());
+                },
+                Ok(dir) => dir.for_each(|sub_file| cur_files.push_back(sub_file.unwrap())),
+            }
         } else {
             ret_files.push(file.path().to_string_lossy().to_string());
         }
@@ -112,20 +146,15 @@ struct FileIndex {
 }
 
 impl FileIndex {
-    fn new(directory: PathBuf) -> Self {
-        let files: Vec<String> = match find_files_in(&directory) {
-            Some(x) => x,
-            None => vec![],
-        };
-
+    fn new(directory: PathBuf, files: &Option<Vec<String>>) -> Self {
         let mut index: HashMap<PathBuf, SystemTime> = HashMap::new();
-
-        for file in files {
-            let md = std::fs::metadata(&file).unwrap();
-            let time = md.modified().unwrap();
-            index.insert(PathBuf::from(&file), time);
+        if let Some(files) = files {
+            for file in files {
+                let md = std::fs::metadata(&file).unwrap();
+                let time = md.modified().unwrap();
+                index.insert(PathBuf::from(&file), time);
+            }
         }
-
         Self {
             index,
             location: directory,
@@ -217,9 +246,6 @@ async fn copy_with_dir(from: &PathBuf, to: &PathBuf) {
 // for now, just do async file i/o into clone dir, convert to doing it over ssh later
 // precondition: event is one of: new, remove, modify, event is on a file
 // initial files are already mirrored
-//
-// host_file has to be moved into mirror() due to some issue awaiting multiple futures
-// i dont like this however im never reusing the value so its kinda fine
 async fn mirror(host_file: &String, event: Option<&Event>) -> tokio::io::Result<()> {
     let host_file = PathBuf::from(&host_file);
     let target_path = host_path_to_target(&host_file);
@@ -254,16 +280,20 @@ async fn mirror(host_file: &String, event: Option<&Event>) -> tokio::io::Result<
 async fn main() -> Result<> {
     let directory = init_inbox();
     let directory = PathBuf::from(directory);
-    let mut index = FileIndex::new(directory.clone());
+    let files = find_files_in(&directory);
+    let mut index = FileIndex::new(directory.clone(), &files);
     index.print();
 
-    // TODO: one find_files_in() call (one is in FileIndex::new())
-
     // Clone initial files
-    // TODO: proper error handling, log mirror failures
-    if let Some(files) = find_files_in(&directory) {
+    if let Some(files) = files {
         let futures: FuturesUnordered<_> = (&files).into_iter().map(|f| mirror(&f, None)).collect();
-        futures.collect::<Vec<_>>().await;
+        let res: Vec<_> = futures.collect::<Vec<_>>().await;
+        for i in res {
+            if let Err(e) = i {
+                // TODO: log errors to a file here
+                eprintln!("WARN: Failed to mirror a file: {e}");
+            }
+        }
     }
 
     // Start task to monitor files
@@ -274,9 +304,14 @@ async fn main() -> Result<> {
                 .expect("couldn't send event over channel");
         })
         .unwrap();
-        watcher
-            .watch(&directory, RecursiveMode::Recursive)
-            .expect("couldn't start monitoring path");
+        // TODO: handle error, watch all available paths
+        let res = watcher.watch(&directory, RecursiveMode::Recursive);
+
+        if let Err(e) = res {
+            panic!("ERROR: Couldn't watch directoy: {e}");
+            // Log error
+            // find directories in {directory}, try to watch those instead
+        }
 
         loop {
             select! {
